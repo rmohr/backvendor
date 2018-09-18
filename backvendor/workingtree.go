@@ -167,41 +167,66 @@ func (wt *WorkingTree) timeFromRevision(rev string) (time.Time, error) {
 	return t, err
 }
 
+// gitReachableMatchingTag uses git to find a reachable tag from a
+// given revision rev. It limits the reachable tags using the glob
+// pattern match. If exact is true, the tag must be exactly at
+// revision rev, not just reachable (the output is parsed differently
+// in this case).
+func (wt *WorkingTree) gitReachableMatchingTag(rev, match string, exact bool) (string, error) {
+	argv := []string{"describe", "--tags", "--match=" + match}
+	if exact {
+		argv = append(argv, "--exact-match")
+	}
+	buf, err := wt.run(append(argv, rev)...)
+	output := strings.TrimSpace(buf.String())
+	if err != nil {
+		switch {
+		case strings.HasPrefix(output, "fatal: no tag exactly matches "),
+			output == "fatal: No names found, cannot describe anything.",
+			strings.HasPrefix(output, "fatal: No annotated tags can describe "),
+			strings.HasPrefix(output, "fatal: No tags can describe "):
+			err = ErrorVersionNotFound
+		default:
+			os.Stderr.Write(buf.Bytes())
+		}
+		return "", err
+	}
+
+	var tag string
+	if exact {
+		tag = output
+	} else {
+		fields := strings.Split(output, "-")
+		if len(fields) < 3 {
+			return "", fmt.Errorf("too few dashes: %s", tag)
+		}
+		tag = strings.Join(fields[:len(fields)-2], "-")
+	}
+	return tag, nil
+}
+
 // reachableTag returns the most recent reachable semver tag.
 func (wt *WorkingTree) reachableTag(rev string) (string, error) {
 	if wt.VCS.Cmd != vcsGit {
 		return "", ErrorUnknownVCS
 	}
 
-	var tag string
-	for _, match := range []string{"v[0-9]*", "[0-9]*"} {
-		buf, err := wt.run("describe", "--tags", "--match="+match, rev)
-		output := strings.TrimSpace(buf.String())
-		if err == nil {
-			tag = output
-			break
-		}
-
-		if output != "fatal: No names found, cannot describe anything." &&
-			!strings.HasPrefix(output, "fatal: No annotated tags can describe ") &&
-			!strings.HasPrefix(output, "fatal: No tags can describe ") {
-			os.Stderr.Write(buf.Bytes())
-			return "", err
+	for _, exact := range []bool{true, false} {
+		for _, match := range []string{"v[0-9]*", "[0-9]*"} {
+			tag, err := wt.gitReachableMatchingTag(rev, match, exact)
+			if err != nil {
+				if err == ErrorVersionNotFound {
+					continue
+				}
+				return "", err
+			}
+			if tag != "" {
+				return tag, nil
+			}
 		}
 	}
 
-	if tag == "" {
-		return "", ErrorVersionNotFound
-	}
-
-	log.Debugf("%s is described as %s", rev, tag)
-	fields := strings.Split(tag, "-")
-	if len(fields) < 3 {
-		// This matches a tag exactly (it must not be a semver tag)
-		return tag, nil
-	}
-	tag = strings.Join(fields[:len(fields)-2], "-")
-	return tag, nil
+	return "", ErrorVersionNotFound
 }
 
 func (wt *WorkingTree) PseudoVersion(rev string) (string, error) {
