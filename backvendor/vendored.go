@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Masterminds/semver"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/vcs"
 )
@@ -159,7 +160,7 @@ func updateHashesAfterStrip(hashes *FileHashes, wt *WorkingTree, ref string, pat
 	return anyChanged, nil
 }
 
-func matchFromRefs(strip bool, hashes *FileHashes, wt *WorkingTree, refs []string) (string, error) {
+func matchFromRefs(strip bool, hashes *FileHashes, wt *WorkingTree, refs []string) ([]string, error) {
 	var paths []string
 	if strip {
 		for hash, _ := range hashes.hashes {
@@ -191,6 +192,7 @@ func matchFromRefs(strip bool, hashes *FileHashes, wt *WorkingTree, refs []strin
 		return changed && hashes.IsSubsetOf(th), nil
 	}
 
+	matches := make([]string, 0)
 	for _, ref := range refs {
 		log.Debugf("%s: trying match", ref)
 		tagHashes, err := wt.FileHashesFromRef(ref)
@@ -198,18 +200,26 @@ func matchFromRefs(strip bool, hashes *FileHashes, wt *WorkingTree, refs []strin
 			if err == ErrorInvalidRef {
 				continue
 			}
-			return "", err
+			return nil, err
 		}
 		ok, err := matchFromRef(tagHashes, ref)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if ok {
-			return ref, nil
+			matches = append(matches, ref)
+			continue
+		} else if len(matches) > 0 {
+			// This is the end of a matching run of refs
+			break
 		}
 	}
 
-	return "", ErrorVersionNotFound
+	if len(matches) == 0 {
+		return nil, ErrorVersionNotFound
+	}
+
+	return matches, nil
 }
 
 // Reference describes the origin of a vendored project.
@@ -226,6 +236,23 @@ type Reference struct {
 	// Ver is the semantic version or pseudo-version for the
 	// commit named in Reference. This is Tag if Tag is not "".
 	Ver string
+}
+
+// chooseBestTag takes a sorted list of tags and returns the oldest
+// semver tag which is not a prerelease, or else the oldest tag.
+func chooseBestTag(tags []string) string {
+	for i := len(tags) - 1; i >= 0; i-- {
+		tag := tags[i]
+		v, err := semver.NewVersion(tag)
+		if err != nil {
+			continue
+		}
+		if v.Prerelease() == "" {
+			return tag
+		}
+	}
+
+	return tags[len(tags)-1]
 }
 
 // DescribeProject attempts to identify the tag in the version control
@@ -270,10 +297,12 @@ func (src GoSource) DescribeProject(project *vcs.RepoRoot, root string) (*Refere
 	// project's vendored files (but not files from the top-level
 	// project).
 	strip := src.usesGodep && root != src.Path
-	match, err := matchFromRefs(strip, hashes, wt, tags)
+	matches, err := matchFromRefs(strip, hashes, wt, tags)
 	switch err {
 	case nil:
 		// Found a match
+		match := chooseBestTag(matches)
+		log.Debugf("best from %v: %v", matches, match)
 		rev, err := wt.RevisionFromTag(match)
 		if err != nil {
 			return nil, err
@@ -297,11 +326,13 @@ func (src GoSource) DescribeProject(project *vcs.RepoRoot, root string) (*Refere
 		return nil, err
 	}
 
-	rev, err := matchFromRefs(strip, hashes, wt, revs)
+	matches, err = matchFromRefs(strip, hashes, wt, revs)
 	if err != nil {
 		return nil, err
 	}
 
+	// Use newest matching revision
+	rev := matches[0]
 	ver, err := wt.PseudoVersion(rev)
 	if err != nil {
 		return nil, err
